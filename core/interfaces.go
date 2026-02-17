@@ -27,7 +27,7 @@ type Database interface {
 	// RestoreFromDump restores the database dump in the directory
 	// passed in to the database and writes progress logging to the
 	// specified path.
-	RestoreFromDump(dumpDir string, logFile string, includeStatusHistory, copyController bool) error
+	RestoreFromDump(dumpDir string, logFile string, includeStatusHistory, copyController, dryRun bool) error
 
 	// Close terminates the database connection.
 	Close()

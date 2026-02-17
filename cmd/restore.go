@@ -6,6 +6,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 
@@ -32,7 +33,7 @@ func NewRestoreCommand(
 	dbConnect func(info db.DialInfo) (core.Database, error),
 	openBackup func(path, tempRoot string) (core.BackupFile, error),
 	machineConverter func(member core.ReplicaSetMember) core.ControllerNode,
-	loadCreds func() (string, string, error),
+	loadCreds func() (MongoCredentialInfo, error),
 	devMode bool,
 ) cmd.Command {
 	return &restoreCommand{
@@ -50,16 +51,20 @@ type restoreCommand struct {
 	connect    func(info db.DialInfo) (core.Database, error)
 	openBackup func(path, tempRoot string) (core.BackupFile, error)
 	converter  func(member core.ReplicaSetMember) core.ControllerNode
-	loadCreds  func() (string, string, error)
+	loadCreds  func() (MongoCredentialInfo, error)
 
 	allowDowngrade bool
 	devMode        bool
 
-	hostname string
-	port     string
-	ssl      bool
-	username string
-	password string
+	hostname         string
+	port             string
+	ssl              bool
+	username         string
+	password         string
+	caCertPath       string
+	caPrivateKeyPath string
+	caCert           string
+	caPrivateKey     string
 
 	verbose              bool
 	loggingConfig        string
@@ -69,6 +74,7 @@ type restoreCommand struct {
 	includeStatusHistory bool
 	copyController       bool
 	assumeYes            bool
+	dryRun               bool
 
 	// manualAgentControl determines if 'juju-restore' or the operator
 	// manages - stops and starts juju and mongo agents - on
@@ -104,6 +110,8 @@ func (c *restoreCommand) SetFlags(f *gnuflag.FlagSet) {
 	f.BoolVar(&c.ssl, "ssl", true, "use SSL to connect to MongoDB")
 	f.StringVar(&c.username, "username", "", "user for connecting to MongoDB (omit to get credentials from agent.conf)")
 	f.StringVar(&c.password, "password", "", "password for connecting to MongoDB")
+	f.StringVar(&c.caCertPath, "ca-cert-path", "", "CA certificate for connecting to MongoDB (omit to get CA cert from agent.conf)")
+	f.StringVar(&c.caPrivateKeyPath, "ca-private-key-path", "", "CA Certificate private key for connecting to MongoDB")
 	f.StringVar(&c.loggingConfig, "logging-config", defaultLogConfig, "set logging levels")
 	f.BoolVar(&c.verbose, "verbose", false, "more output from restore (debug logging)")
 	f.BoolVar(&c.manualAgentControl, "manual-agent-control", false, "operator manages secondary controller nodes in HA, e.g stops/starts Juju and Mongo agents")
@@ -113,6 +121,7 @@ func (c *restoreCommand) SetFlags(f *gnuflag.FlagSet) {
 	f.BoolVar(&c.copyController, "copy-controller", false, "set up the target controller to mirror the controller from the backup")
 	f.BoolVar(&c.allowDowngrade, "allow-downgrade", false, "allow restoring a backup from an older Juju version")
 	f.BoolVar(&c.assumeYes, "yes", false, "answer 'yes' to confirmation prompts (non-interactive)")
+	f.BoolVar(&c.dryRun, "dry-run", false, "go through all the steps except actually performing the restore operation")
 	if c.devMode {
 		f.BoolVar(&c.restart, "rs", false, "just restart agents that were stopped (JUJU_RESTORE_DEV_MODE)")
 	}
@@ -138,6 +147,21 @@ func (c *restoreCommand) Init(args []string) error {
 			return errors.New("--allow-downgrade incompatible with --copy-controller")
 		}
 	}
+	if c.caCertPath != "" {
+		if c.caPrivateKeyPath == "" {
+			return errors.New("ca-private-key-path must be set if ca-cert-path is set")
+		}
+		cacert, err := os.ReadFile(c.caCertPath)
+		if err != nil {
+			return errors.Annotatef(err, "reading CA certificate from %q", c.caCertPath)
+		}
+		caprivatekey, err := os.ReadFile(c.caPrivateKeyPath)
+		if err != nil {
+			return errors.Annotatef(err, "reading CA private key from %q", c.caPrivateKeyPath)
+		}
+		c.caCert = string(cacert)
+		c.caPrivateKey = string(caprivatekey)
+	}
 	return c.CommandBase.Init(args)
 }
 
@@ -148,23 +172,34 @@ func (c *restoreCommand) Run(ctx *cmd.Context) error {
 		return errors.Trace(err)
 	}
 
+	mongoCreds, err := c.loadCreds()
+	if err != nil {
+		return errors.Annotate(err, "loading credentials")
+	}
+
 	username := c.username
 	password := c.password
+	cacert := c.caCert
+	caprivatekey := c.caPrivateKey
 	if c.username == "" {
-		username, password, err = c.loadCreds()
-		if err != nil {
-			return errors.Annotate(err, "loading credentials")
-		}
+		username = mongoCreds.Username
+		password = mongoCreds.Password
+	}
+	if c.caCert == "" {
+		cacert = mongoCreds.CACert
+		caprivatekey = mongoCreds.CAPrivateKey
 	}
 
 	c.ui = NewUserInteractions(ctx)
 	c.ui.Notify("Connecting to database...\n")
 	database, err := c.connect(db.DialInfo{
-		Hostname: c.hostname,
-		Port:     c.port,
-		Username: username,
-		Password: password,
-		SSL:      c.ssl,
+		Hostname:     c.hostname,
+		Port:         c.port,
+		Username:     username,
+		Password:     password,
+		SSL:          c.ssl,
+		CACert:       cacert,
+		CAPrivateKey: caprivatekey,
 	})
 	if err != nil {
 		return errors.Trace(err)
@@ -267,7 +302,7 @@ func (c *restoreCommand) restore() error {
 	}
 	c.ui.Notify("\nRunning restore...\n")
 	c.ui.Notify(fmt.Sprintf("Detailed mongorestore output in %s.\n", c.restoreLog))
-	if err := c.restorer.Restore(c.restoreLog, c.includeStatusHistory, c.copyController); err != nil {
+	if err := c.restorer.Restore(c.restoreLog, c.includeStatusHistory, c.copyController, c.dryRun); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -303,44 +338,66 @@ const agentConfPattern = "/var/lib/juju/agents/machine-*/agent.conf"
 
 // ReadCredsFromAgentConf tries to load a mongo username and password
 // from the standard agent.conf location on a controller machine.
-func ReadCredsFromAgentConf() (string, string, error) {
+func ReadCredsFromAgentConf() (MongoCredentialInfo, error) {
 	return ReadCredsFromPattern(agentConfPattern, readFileWithSudo)
+}
+
+// MongoCredentialInfo holds the information needed to authenticate
+// to the Juju MongoDB server.
+type MongoCredentialInfo struct {
+	Username     string
+	Password     string
+	CACert       string
+	CAPrivateKey string
 }
 
 // ReadCredsFromPattern tries to load a mongo username and password
 // from the first file it finds matching the pattern passed in.
-func ReadCredsFromPattern(pattern string, readFile func(string) ([]byte, error)) (string, string, error) {
+func ReadCredsFromPattern(pattern string, readFile func(string) ([]byte, error)) (MongoCredentialInfo, error) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		return "", "", errors.Trace(err)
+		return MongoCredentialInfo{}, errors.Trace(err)
 	}
 	if len(matches) == 0 {
-		return "", "", errors.Errorf("couldn't find an agent.conf - please specify username and password")
+		return MongoCredentialInfo{}, errors.Errorf("couldn't find an agent.conf - please specify username and password")
 	}
 	conf := matches[0]
 
 	var creds struct {
-		Username string `yaml:"tag"`
-		Password string `yaml:"statepassword"`
+		Username     string `yaml:"tag"`
+		Password     string `yaml:"statepassword"`
+		CACert       string `yaml:"cacert"`
+		CAPrivateKey string `yaml:"caprivatekey"`
 	}
 
 	data, err := readFile(conf)
 	if err != nil {
-		return "", "", errors.Annotatef(err, "reading %q with sudo", conf)
+		return MongoCredentialInfo{}, errors.Annotatef(err, "reading %q with sudo", conf)
 	}
 	err = yaml.Unmarshal(data, &creds)
 	if err != nil {
-		return "", "", errors.Annotatef(err, "unmarshalling %q", conf)
+		return MongoCredentialInfo{}, errors.Annotatef(err, "unmarshalling %q", conf)
 	}
 
 	if creds.Username == "" {
-		return "", "", errors.Errorf("no username found in %q - tag field is missing or blank", conf)
+		return MongoCredentialInfo{}, errors.Errorf("no username found in %q - tag field is missing or blank", conf)
 	}
 	if creds.Password == "" {
-		return "", "", errors.Errorf("no password found in %q - statepassword field is missing or blank", conf)
+		return MongoCredentialInfo{}, errors.Errorf("no password found in %q - statepassword field is missing or blank", conf)
+	}
+	if creds.CACert == "" {
+		return MongoCredentialInfo{}, errors.Errorf("no CA certificate found in %q - cacert field is missing or blank", conf)
+	}
+	if creds.CAPrivateKey == "" {
+		return MongoCredentialInfo{}, errors.Errorf("no CA certificate private key found in %q - caprivatekey field is missing or blank", conf)
 	}
 
-	return creds.Username, creds.Password, nil
+	return MongoCredentialInfo{
+		Username:     creds.Username,
+		Password:     creds.Password,
+		CACert:       creds.CACert,
+		CAPrivateKey: creds.CAPrivateKey,
+	}, nil
 }
 
 func readFileWithSudo(path string) ([]byte, error) {

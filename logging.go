@@ -24,8 +24,9 @@ func NewColorWriter(writer io.Writer) loggo.Writer {
 
 // Write implements Writer. Output is prefixed with log level (colored
 // appropriately), for example WARNING would be yellow in the following:
-//   WARNING the message...
+//
+//	WARNING the message...
 func (w *colorWriter) Write(entry loggo.Entry) {
-	loggocolor.SeverityColor[entry.Level].Fprintf(w.writer, entry.Level.String())
+	loggocolor.SeverityColor[entry.Level].Fprint(w.writer, entry.Level.String())
 	fmt.Fprintf(w.writer, " %s\n", entry.Message)
 }
