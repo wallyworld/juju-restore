@@ -455,6 +455,7 @@ func (db *database) buildControllerRestoreArgs(dumpPath, caCertPath, certPath st
 		"--authenticationDatabase=admin",
 		"--username", db.info.Username,
 		"--password", db.info.Password,
+		"--ssl",
 		"--sslCAFile", caCertPath,
 		"--sslPEMKeyFile", certPath,
 		"--sslPEMKeyPassword=ignored",
