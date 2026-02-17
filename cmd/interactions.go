@@ -65,5 +65,5 @@ func (ui *UserInteractions) UserConfirmYes() error {
 // This ensures that all messages that require user attention
 // go consistently to the same writer.
 func (ui *UserInteractions) Notify(message string) {
-	fmt.Fprintf(ui.ctx.Stdout, message)
+	fmt.Fprint(ui.ctx.Stdout, message)
 }

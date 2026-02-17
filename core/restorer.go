@@ -277,7 +277,7 @@ func (r *Restorer) CheckRestorable(allowDowngrade, copyController bool) (*Preche
 
 // Restore replaces the database's contents with the data from the
 // backup's database dump.
-func (r *Restorer) Restore(logPath string, includeStatusHistory, copyController bool) error {
+func (r *Restorer) Restore(logPath string, includeStatusHistory, copyController, dryRun bool) error {
 	controller, err := r.db.ControllerInfo()
 	if err != nil {
 		return errors.Annotate(err, "getting controller info")
@@ -287,7 +287,7 @@ func (r *Restorer) Restore(logPath string, includeStatusHistory, copyController 
 		return errors.Annotatef(err, "getting backup metadata")
 	}
 	logger.Debugf("restoring dump")
-	err = r.db.RestoreFromDump(r.backup.DumpDirectory(), logPath, includeStatusHistory, copyController)
+	err = r.db.RestoreFromDump(r.backup.DumpDirectory(), logPath, includeStatusHistory, copyController, dryRun)
 	if err != nil {
 		return errors.Annotatef(err, "restoring dump from %q", r.backup.DumpDirectory())
 	}
@@ -326,5 +326,5 @@ func collectMachineErrors(results map[string]error) error {
 	}
 	// Ensure they're reported in a consistent order.
 	sort.Strings(messages)
-	return errors.Errorf(strings.Join(messages, "\n"))
+	return errors.New(strings.Join(messages, "\n"))
 }

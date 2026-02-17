@@ -710,11 +710,11 @@ func (s *restorerSuite) TestRestoreSameVersion(c *gc.C) {
 	)
 	c.Assert(err, jc.ErrorIsNil)
 	db.SetErrors(errors.Errorf("bad!"))
-	err = r.Restore("log path", true, false)
+	err = r.Restore("log path", true, false, false)
 	c.Assert(err, gc.ErrorMatches, `restoring dump from "the dump dir!": bad!`)
 
 	c.Assert(db.Calls(), gc.HasLen, 3)
-	db.CheckCall(c, 2, "RestoreFromDump", "the dump dir!", "log path", true, false)
+	db.CheckCall(c, 2, "RestoreFromDump", "the dump dir!", "log path", true, false, false)
 }
 
 func (s *restorerSuite) TestRestoreDowngrade(c *gc.C) {
@@ -766,11 +766,11 @@ func (s *restorerSuite) TestRestoreDowngrade(c *gc.C) {
 		convertToMachine,
 	)
 	c.Assert(err, jc.ErrorIsNil)
-	err = r.Restore("log path", true, false)
+	err = r.Restore("log path", true, false, false)
 	c.Assert(err, jc.ErrorIsNil)
 
 	c.Assert(db.Calls(), gc.HasLen, 3)
-	db.CheckCall(c, 2, "RestoreFromDump", "the dump dir!", "log path", true, false)
+	db.CheckCall(c, 2, "RestoreFromDump", "the dump dir!", "log path", true, false, false)
 
 	for i, machine := range machines {
 		c.Logf("machine %d", i)
@@ -832,7 +832,7 @@ func (s *restorerSuite) TestRestoreDowngradeError(c *gc.C) {
 	machines[0].SetErrors(errors.New("stuff went bad"))
 	machines[1].SetErrors(errors.New("oopsy daisy"))
 
-	err = r.Restore("log path", true, false)
+	err = r.Restore("log path", true, false, false)
 	c.Assert(err, gc.ErrorMatches, `
 problems updating controllers to version "2.7.6": updating node 1.1.1.1: stuff went bad
 updating node 1.1.1.2: oopsy daisy`[1:])
@@ -859,8 +859,8 @@ func (d *fakeDatabase) CopyController(controller core.ControllerInfo) error {
 	return nil
 }
 
-func (db *fakeDatabase) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController bool) error {
-	db.Stub.MethodCall(db, "RestoreFromDump", dumpDir, logFile, includeStatusHistory, copyController)
+func (db *fakeDatabase) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController, dryRun bool) error {
+	db.Stub.MethodCall(db, "RestoreFromDump", dumpDir, logFile, includeStatusHistory, copyController, dryRun)
 	return db.Stub.NextErr()
 }
 

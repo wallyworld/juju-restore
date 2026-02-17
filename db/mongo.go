@@ -5,19 +5,23 @@ package db
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/juju/collections/set"
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
-	"github.com/juju/mgo/v2"
-	"github.com/juju/mgo/v2/bson"
-	"github.com/juju/replicaset/v2"
+	"github.com/juju/mgo/v3"
+	"github.com/juju/mgo/v3/bson"
+	"github.com/juju/replicaset/v3"
 	"github.com/juju/version/v2"
 
 	"github.com/juju/juju-restore/core"
@@ -27,11 +31,13 @@ var logger = loggo.GetLogger("juju-restore.db")
 
 // DialInfo holds information needed to connect to the database.
 type DialInfo struct {
-	Hostname string
-	Port     string
-	Username string
-	Password string
-	SSL      bool
+	Hostname     string
+	Port         string
+	Username     string
+	Password     string
+	SSL          bool
+	CACert       string
+	CAPrivateKey string
 }
 
 // Dial creates a new connection to the specified database.
@@ -44,7 +50,7 @@ func Dial(args DialInfo) (core.Database, error) {
 		Direct:   true,
 	}
 	if args.SSL {
-		info.DialServer = dialSSL
+		info.DialServer = dialSSLFunc(args.CACert, args.CAPrivateKey)
 	}
 	session, err := mgo.DialWithInfo(&info)
 	if err != nil {
@@ -411,7 +417,7 @@ const (
 	homeSnapDir       = "snap/juju-db/common" // relative to $HOME
 )
 
-func (db *database) buildRestoreArgs(dumpPath string, includeStatusHistory bool) []string {
+func (db *database) buildRestoreArgs(dumpPath, caCertPath, certPath string, includeStatusHistory, dryRun bool) []string {
 	args := []string{
 		"-vvvvv",
 		"--drop",
@@ -422,18 +428,24 @@ func (db *database) buildRestoreArgs(dumpPath string, includeStatusHistory bool)
 		"--username", db.info.Username,
 		"--password", db.info.Password,
 		"--ssl",
-		"--sslAllowInvalidCertificates",
+		"--sslCAFile", caCertPath,
+		"--sslPEMKeyFile", certPath,
+		"--sslPEMKeyPassword=ignored",
 		"--stopOnError",
 		"--maintainInsertionOrder",
 		"--nsExclude=logs.*",
 	}
+	if dryRun {
+		args = append(args, "--dryRun")
+	}
 	if !includeStatusHistory {
 		args = append(args, "--nsExclude=juju.statuseshistory")
 	}
+	fmt.Println(args)
 	return append(args, dumpPath)
 }
 
-func (db *database) buildControllerRestoreArgs(dumpPath string) []string {
+func (db *database) buildControllerRestoreArgs(dumpPath, caCertPath, certPath string, dryRun bool) []string {
 	args := []string{
 		"-vvvvv",
 		"--drop",
@@ -443,8 +455,9 @@ func (db *database) buildControllerRestoreArgs(dumpPath string) []string {
 		"--authenticationDatabase=admin",
 		"--username", db.info.Username,
 		"--password", db.info.Password,
-		"--ssl",
-		"--sslAllowInvalidCertificates",
+		"--sslCAFile", caCertPath,
+		"--sslPEMKeyFile", certPath,
+		"--sslPEMKeyPassword=ignored",
 		"--stopOnError",
 		"--maintainInsertionOrder",
 		"--nsFrom=juju.*",
@@ -460,11 +473,14 @@ func (db *database) buildControllerRestoreArgs(dumpPath string) []string {
 		"--nsInclude=juju.secretBackends",
 		"--nsInclude=juju.secretBackendsRotate",
 	}
+	if dryRun {
+		args = append(args, "--dryRun")
+	}
 	return append(args, dumpPath)
 }
 
 // RestoreFromDump uses mongorestore to load the dump from a backup.
-func (db *database) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController bool) error {
+func (db *database) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController, dryRun bool) error {
 	binary, isSnap, err := db.getRestoreBinary()
 	if err != nil {
 		return errors.Trace(err)
@@ -485,16 +501,21 @@ func (db *database) RestoreFromDump(dumpDir, logFile string, includeStatusHistor
 		}()
 	}
 
+	caCertFile, clientCertFile, err := db.createRestoreCertificates(dumpDir, err)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
 	command := exec.Command(
 		binary,
-		db.buildRestoreArgs(dumpDir, includeStatusHistory)...,
+		db.buildRestoreArgs(dumpDir, clientCertFile, clientCertFile, includeStatusHistory, dryRun)...,
 	)
 	// If we are copying a controller, we restore a subset of the collections
 	// to a staging database and later copy the relevant data.
 	if copyController {
 		command = exec.Command(
 			binary,
-			db.buildControllerRestoreArgs(dumpDir)...,
+			db.buildControllerRestoreArgs(dumpDir, caCertFile, clientCertFile, dryRun)...,
 		)
 	}
 	logger.Debugf("running restore command: %s", strings.Join(command.Args, " "))
@@ -504,7 +525,7 @@ func (db *database) RestoreFromDump(dumpDir, logFile string, includeStatusHistor
 	// issue with the Snap mongorestore writing to the file.
 	output, err := command.CombinedOutput()
 	if err != nil {
-		logger.Debugf("%s output:\n%s", binary, output)
+		logger.Errorf("%s output:\n%s", binary, output)
 		return errors.Annotatef(err, "running %s", binary)
 	}
 	err = ioutil.WriteFile(logFile, output, 0664)
@@ -513,6 +534,60 @@ func (db *database) RestoreFromDump(dumpDir, logFile string, includeStatusHistor
 		return errors.Annotatef(err, "writing output to %s", logFile)
 	}
 	return nil
+}
+
+func (db *database) createRestoreCertificates(dumpDir string, err error) (string, string, error) {
+	caCert, err := os.Create(filepath.Join(dumpDir, "ca-cert.ca"))
+	if err != nil {
+		return "", "", errors.Annotate(err, "creating ca cert file")
+	}
+	defer caCert.Close()
+
+	_, err = caCert.WriteString(db.info.CACert)
+	if err != nil {
+		return "", "", errors.Annotate(err, "writing ca cert file")
+	}
+
+	clientCert, err := tls.X509KeyPair([]byte(db.info.CACert), []byte(db.info.CAPrivateKey))
+	if err != nil {
+		return "", "", errors.Annotate(err, "parsing client certificate key pair")
+	}
+	if len(clientCert.Certificate) > 0 {
+		x509Cert, err := x509.ParseCertificate(clientCert.Certificate[0])
+		if err != nil {
+			return "", "", errors.Annotate(err, "parsing leaf certificate")
+		}
+		clientCert.Leaf = x509Cert
+	}
+
+	clientCertFile, err := os.Create(filepath.Join(dumpDir, "client-cert.pem"))
+	if err != nil {
+		return "", "", errors.Annotate(err, "creating client cert file")
+	}
+	defer clientCertFile.Close()
+
+	// Write each certificate in the chain to the PEM file
+	for _, certBytes := range clientCert.Certificate {
+		block := &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: certBytes,
+		}
+		if err := pem.Encode(clientCertFile, block); err != nil {
+			return "", "", errors.Annotate(err, "encoding certificate to PEM")
+		}
+	}
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(clientCert.PrivateKey)
+	if err != nil {
+		return "", "", errors.Annotate(err, "marshalling private key")
+	}
+	block := &pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: keyBytes,
+	}
+	if err := pem.Encode(clientCertFile, block); err != nil {
+		return "", "", errors.Annotate(err, "encoding private key to PEM")
+	}
+	return caCert.Name(), clientCertFile.Name(), nil
 }
 
 func (db *database) getRestoreBinary() (binary string, isSnap bool, err error) {
@@ -551,17 +626,77 @@ func (db *database) Close() {
 	db.session.Close()
 }
 
-func dialSSL(addr *mgo.ServerAddr) (net.Conn, error) {
-	c, err := net.Dial("tcp", addr.String())
+const jujuMongoDBDNSName = "juju-mongodb"
+
+func dialSSLFunc(caCert, caPrivateKey string) func(addr *mgo.ServerAddr) (net.Conn, error) {
+	return func(addr *mgo.ServerAddr) (net.Conn, error) {
+		c, err := net.DialTimeout("tcp", addr.String(), 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig := &tls.Config{
+			ServerName: jujuMongoDBDNSName,
+		}
+		if caCert != "" {
+			certPool, err := createCertPool(caCert)
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig.RootCAs = certPool
+		}
+		tlsConfig.MinVersion = tls.VersionTLS12
+		moreSuites := []uint16{
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		}
+		tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, moreSuites...)
+
+		// Create client certificate from CA cert and key.
+		clientCert, err := tls.X509KeyPair([]byte(caCert), []byte(caPrivateKey))
+		if err != nil {
+			return nil, errors.Annotate(err, "parsing client certificate key pair")
+		}
+		if len(clientCert.Certificate) > 0 {
+			x509Cert, err := x509.ParseCertificate(clientCert.Certificate[0])
+			if err != nil {
+				return nil, errors.Annotate(err, "parsing leaf certificate")
+			}
+			clientCert.Leaf = x509Cert
+		}
+		tlsConfig.Certificates = []tls.Certificate{clientCert}
+
+		cc := tls.Client(c, tlsConfig)
+		if err := cc.Handshake(); err != nil {
+			logger.Criticalf("TLS handshake failed: %v", err)
+			_ = c.Close()
+			return nil, err
+		}
+		return cc, nil
+	}
+}
+
+func createCertPool(caCert string) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	xcert, err := parseCert(caCert)
 	if err != nil {
-		return nil, err
+		return nil, errors.Annotatef(err, "cannot parse certificate %q", caCert)
 	}
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
+	pool.AddCert(xcert)
+	return pool, nil
+}
+
+func parseCert(certPEM string) (*x509.Certificate, error) {
+	certPEMData := []byte(certPEM)
+	for len(certPEMData) > 0 {
+		var certBlock *pem.Block
+		certBlock, certPEMData = pem.Decode(certPEMData)
+		if certBlock == nil {
+			break
+		}
+		if certBlock.Type == "CERTIFICATE" {
+			cert, err := x509.ParseCertificate(certBlock.Bytes)
+			return cert, err
+		}
 	}
-	cc := tls.Client(c, tlsConfig)
-	if err := cc.Handshake(); err != nil {
-		return nil, err
-	}
-	return cc, nil
+	return nil, errors.New("no certificates found")
 }

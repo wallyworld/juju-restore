@@ -31,7 +31,7 @@ type restoreSuite struct {
 	connectF  func(db.DialInfo) (core.Database, error)
 	openF     func(string, string) (core.BackupFile, error)
 	converter func(member core.ReplicaSetMember) core.ControllerNode
-	loadCreds func() (string, string, error)
+	loadCreds func() (cmd.MongoCredentialInfo, error)
 	devMode   bool
 }
 
@@ -87,8 +87,13 @@ func (s *restoreSuite) SetUpTest(c *gc.C) {
 	s.connectF = func(db.DialInfo) (core.Database, error) { return s.database, nil }
 	s.openF = func(string, string) (core.BackupFile, error) { return s.backup, nil }
 	s.converter = machine.ControllerNodeForReplicaSetMember
-	s.loadCreds = func() (string, string, error) {
-		return "", "", errors.Errorf("loading those creds")
+	s.loadCreds = func() (cmd.MongoCredentialInfo, error) {
+		return cmd.MongoCredentialInfo{
+			Username:     "fred",
+			Password:     "secret",
+			CACert:       "ca-cert",
+			CAPrivateKey: "private-key",
+		}, nil
 	}
 
 }
@@ -613,8 +618,19 @@ Primary node may have shifted.
 }
 
 func (s *restoreSuite) TestLoadsCredsIfNoUsername(c *gc.C) {
+	s.loadCreds = func() (cmd.MongoCredentialInfo, error) {
+		return cmd.MongoCredentialInfo{}, errors.New("kaboom")
+	}
 	_, err := s.runCmdNoUser(c, "", "backup.file")
-	c.Assert(err, gc.ErrorMatches, "loading credentials: loading those creds")
+	c.Assert(err, gc.ErrorMatches, "loading credentials: kaboom")
+}
+
+func (s *restoreSuite) TestLoadsCACertIfNoCACert(c *gc.C) {
+	s.loadCreds = func() (cmd.MongoCredentialInfo, error) {
+		return cmd.MongoCredentialInfo{}, errors.New("kaboom")
+	}
+	_, err := s.runCmdNoUser(c, "", "--username", "fred", "--password", "secret", "backup.file")
+	c.Assert(err, gc.ErrorMatches, "loading credentials: kaboom")
 }
 
 type readerFunc func(string) ([]byte, error)
@@ -632,13 +648,14 @@ func (s *restoreSuite) TestReadCredsFromPattern(c *gc.C) {
 	err := ioutil.WriteFile(confPath, nil, 0777)
 	c.Assert(err, jc.ErrorIsNil)
 
-	username, password, err := cmd.ReadCredsFromPattern(
+	credInfo, err := cmd.ReadCredsFromPattern(
 		filepath.Join(dir, "*.conf"),
 		makeFakeReader(c, confPath, []byte(agentConfContents)),
 	)
 	c.Assert(err, jc.ErrorIsNil)
-	c.Assert(username, gc.Equals, "porridge-radio")
-	c.Assert(password, gc.Equals, "lilac")
+	c.Assert(credInfo.Username, gc.Equals, "porridge-radio")
+	c.Assert(credInfo.Password, gc.Equals, "lilac")
+	c.Assert(credInfo.CACert, gc.Equals, "some-ca")
 }
 
 func (s *restoreSuite) TestReadCredsMissingUsername(c *gc.C) {
@@ -647,7 +664,7 @@ func (s *restoreSuite) TestReadCredsMissingUsername(c *gc.C) {
 	err := ioutil.WriteFile(confPath, nil, 0777)
 	c.Assert(err, jc.ErrorIsNil)
 
-	_, _, err = cmd.ReadCredsFromPattern(
+	_, err = cmd.ReadCredsFromPattern(
 		filepath.Join(dir, "*.conf"),
 		makeFakeReader(c, confPath, []byte(missingTagConf)),
 	)
@@ -660,11 +677,37 @@ func (s *restoreSuite) TestReadCredsMissingPassword(c *gc.C) {
 	err := ioutil.WriteFile(confPath, nil, 0777)
 	c.Assert(err, jc.ErrorIsNil)
 
-	_, _, err = cmd.ReadCredsFromPattern(
+	_, err = cmd.ReadCredsFromPattern(
 		filepath.Join(dir, "*.conf"),
 		makeFakeReader(c, confPath, []byte(missingPasswordConf)),
 	)
 	c.Assert(err, gc.ErrorMatches, `no password found in ".*/agent\.conf" - statepassword field is missing or blank`)
+}
+
+func (s *restoreSuite) TestReadCredsMissingCACert(c *gc.C) {
+	dir := c.MkDir()
+	confPath := filepath.Join(dir, "agent.conf")
+	err := ioutil.WriteFile(confPath, nil, 0777)
+	c.Assert(err, jc.ErrorIsNil)
+
+	_, err = cmd.ReadCredsFromPattern(
+		filepath.Join(dir, "*.conf"),
+		makeFakeReader(c, confPath, []byte(missingCACertConf)),
+	)
+	c.Assert(err, gc.ErrorMatches, `no CA certificate found in ".*/agent\.conf" - cacert field is missing or blank`)
+}
+
+func (s *restoreSuite) TestReadCredsMissingCAPrivateKey(c *gc.C) {
+	dir := c.MkDir()
+	confPath := filepath.Join(dir, "agent.conf")
+	err := ioutil.WriteFile(confPath, nil, 0777)
+	c.Assert(err, jc.ErrorIsNil)
+
+	_, err = cmd.ReadCredsFromPattern(
+		filepath.Join(dir, "*.conf"),
+		makeFakeReader(c, confPath, []byte(missingCAPrivateKeyConf)),
+	)
+	c.Assert(err, gc.ErrorMatches, `no CA certificate private key found in ".*/agent\.conf" - caprivatekey field is missing or blank`)
 }
 
 var (
@@ -675,6 +718,8 @@ some-field:
 tag: porridge-radio
 other: value
 statepassword: lilac
+cacert: some-ca
+caprivatekey: some-ca-key
 `[1:]
 
 	missingTagConf = `
@@ -683,6 +728,8 @@ some-field:
   something: else
 other: value
 statepassword: lilac
+cacert: some-ca
+caprivatekey: some-ca-key
 `[1:]
 
 	missingPasswordConf = `
@@ -691,6 +738,28 @@ some-field:
   something: else
 tag: porridge-radio
 other: value
+cacert: some-ca
+caprivatekey: some-ca-key
+`[1:]
+
+	missingCACertConf = `
+# format: 2.0
+some-field:
+  something: else
+tag: porridge-radio
+other: value
+statepassword: lilac
+caprivatekey: some-ca-key
+`[1:]
+
+	missingCAPrivateKeyConf = `
+# format: 2.0
+some-field:
+  something: else
+tag: porridge-radio
+other: value
+statepassword: lilac
+cacert: some-ca
 `[1:]
 )
 
@@ -738,8 +807,8 @@ func (d *testDatabase) CopyController(controller core.ControllerInfo) error {
 	return nil
 }
 
-func (d *testDatabase) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController bool) error {
-	d.Stub.MethodCall(d, "RestoreFromDump", dumpDir, logFile, includeStatusHistory)
+func (d *testDatabase) RestoreFromDump(dumpDir, logFile string, includeStatusHistory, copyController, dryRun bool) error {
+	d.Stub.MethodCall(d, "RestoreFromDump", dumpDir, logFile, includeStatusHistory, copyController, dryRun)
 	return d.Stub.NextErr()
 }
 
